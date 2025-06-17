@@ -1,5 +1,6 @@
 use std::str::FromStr;
-use crate::chunk::Chunk;
+use crate::chunk;
+use crate::chunk::Chunk ;
 use crate::chunk_type::ChunkType;
 
 struct Png {
@@ -37,7 +38,8 @@ impl Png {
 	fn chunk_by_type(&self, chunk_type: &str) -> Option<&Chunk> {
 		let search_for = ChunkType::from_str(chunk_type).ok()?;
 
-		self.chunks.iter()
+		self.chunks
+			.iter()
 			.find(|c| c.chunk_type() == &search_for)
 	}
 
@@ -61,27 +63,62 @@ impl std::fmt::Display for Png {
 	}
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum PngError {
+	#[error("invalid PNG signature")]
+	InvalidSignature,
+
+	#[error("no data after PNG signature")]
+	NoData,
+
+	#[error("invalid chunk data")]
+	InvalidChunk(#[from] chunk::ChunkError),
+
+	#[error("unexpected end of data while reading chunks")]
+	UnexpectedEof,
+
+	#[error("error processing chunks")]
+	ChunkProcessing {
+		#[source]
+		source: Box<dyn std::error::Error + Send + Sync>,
+		chunk_offset: usize,
+	}
+}
+
 impl TryFrom<&[u8]> for Png {
-	type Error = ();
+	type Error = PngError;
 
 	fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-		let (signature, rest) = value.split_at(Self::STANDARD_HEADER.len());
+		let (signature, rest) = value.split_at_checked(Self::STANDARD_HEADER.len())
+			.ok_or(PngError::InvalidSignature)?;
 		if signature != Self::STANDARD_HEADER {
-			return Err(());
+			return Err(PngError::InvalidSignature);
+		}
+		
+		if rest.is_empty() {
+			return Err(PngError::NoData);
 		}
 
 		let mut chunks = Vec::new();
 		let mut remaining = rest;
+		let mut offset = Self::STANDARD_HEADER.len();
 		while !remaining.is_empty() {
-			let chunk = Chunk::try_from(remaining)?;
-			let data_length = chunk.length();
-			chunks.push(chunk);
+			let chunk = Chunk::try_from(remaining).map_err(|e| {
+				PngError::ChunkProcessing {
+					source: Box::new(e),
+					chunk_offset: offset,
+				}
+			})?;
 
+			let data_length = chunk.length();
 			let total_chunk_len = Chunk::OVERHEAD_BYTES + data_length as usize;
 			if remaining.len() < total_chunk_len {
-				return Err(());
+				return Err(PngError::UnexpectedEof);
 			}
+			
+			chunks.push(chunk);
 			remaining = &remaining[total_chunk_len..];
+			offset += total_chunk_len;
 		}
 
 		Ok(Png { chunks })
@@ -93,7 +130,7 @@ impl TryFrom<&[u8]> for Png {
 mod tests {
 	use super::*;
 	use pretty_assertions::assert_eq;
-	use crate::chunk_type::ChunkType;
+	use crate::chunk_type::{ChunkType, ChunkTypeError};
 	use crate::chunk::Chunk;
 	use std::convert::TryFrom;
 
@@ -110,7 +147,7 @@ mod tests {
 		Png::from_chunks(chunks)
 	}
 
-	fn chunk_from_strings(chunk_type: &str, data: &str) -> Result<Chunk, ()> {
+	fn chunk_from_strings(chunk_type: &str, data: &str) -> Result<Chunk, ChunkTypeError> {
 		use std::str::FromStr;
 
 		let chunk_type = ChunkType::from_str(chunk_type)?;

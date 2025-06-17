@@ -37,35 +37,75 @@ impl std::fmt::Display for ChunkType {
 	}
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ValidationError {
+	#[error("chunk type contains non-ASCII characters")]
+	NonAscii,
+
+	#[error("chunk type has reserved bit set to 0 (must be 1)")]
+	ReservedBit,
+}
+
 impl TryFrom<[u8; 4]> for ChunkType {
-	type Error = ();
+	type Error = ValidationError;
 
 	fn try_from(value: [u8; 4]) -> Result<Self, Self::Error> {
 		let ct = ChunkType { type_code: value };
 
 		if !ct.type_code.iter().all(|b| b.is_ascii_alphabetic()) {
-			return Err(())
+			return Err(Self::Error::NonAscii);
 		}
 
 		if !ct.is_reserved_bit_valid() {
-			return Err(())
+			return Err(Self::Error::ReservedBit);
 		}
 
 		Ok(ct)
 	}
 }
 
-impl std::str::FromStr for ChunkType {
-	type Err = ();
+#[derive(thiserror::Error, Debug)]
+pub enum ParseError {
+	#[error("expected 4 bytes, but was given {0}")]
+	InvalidLength(usize),
 
-	fn from_str(s: &str) -> Result<Self, Self::Err> {
+	#[error("error converting string slice '{0}' into array")]
+	FromSlice(#[from] std::array::TryFromSliceError),
+}
+
+impl ChunkType {
+	// Helper for the FromStr impl below.
+	/// Parses the given string into a 4-byte array.
+	fn parse_type_code(s: &str) -> Result<[u8; 4], ParseError> {
 		let bytes = s.as_bytes();
-		let type_code: [u8; 4] = bytes.try_into().map_err(|_| ())?;
+		let length = bytes.len();
+		if length > 4 {
+			return Err(ParseError::InvalidLength(length));
+		}
 
-		ChunkType::try_from(type_code)
+		let type_code: [u8; 4] = bytes.try_into()?;
+		Ok(type_code)
 	}
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ChunkTypeError {
+	#[error(transparent)]
+	Parse(#[from] ParseError),
+
+	#[error(transparent)]
+	Validation(#[from] ValidationError),
+}
+
+impl std::str::FromStr for ChunkType {
+	type Err = ChunkTypeError;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		let type_code = Self::parse_type_code(s)?;
+
+		Ok(ChunkType::try_from(type_code)?)
+	}
+}
 
 #[cfg(test)]
 mod tests {

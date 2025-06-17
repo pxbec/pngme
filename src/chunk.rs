@@ -1,4 +1,5 @@
 use std::{str, usize};
+use crate::chunk_type;
 use crate::chunk_type::ChunkType;
 
 
@@ -67,21 +68,49 @@ impl std::fmt::Display for Chunk {
 	}
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum ChunkError {
+	#[error("chunk type is not supported")]
+	FromSlice(#[from] std::array::TryFromSliceError),
+	
+	#[error("chunk data is shorter than the minimum required size")]
+	InsufficientChunkBytes,
+	
+	#[error("chunk length too short (expected '{expected}', got '{actual}')")]
+	LengthMismatch {
+		expected: u32,
+		actual: u32,
+	},
+	
+	#[error("crc failed (expected '{expected}', got '{actual}'")]
+	CRC32Mismatch {
+		expected: u32,
+		actual: u32,
+	},
+	
+	#[error(transparent)]
+	ChunkType(#[from] chunk_type::ValidationError),
+}
+
 impl TryFrom<&[u8]> for Chunk {
-	type Error = ();
+	type Error = ChunkError;
 
 	fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
 		// Minimum chunk size: 4 (len) + 4 (type) + 0 (msg) + 4 (crc)
-		if value.len() < Self::OVERHEAD_BYTES {
-			return Err(());
+		let actual_length = value.len();
+		if actual_length < Self::OVERHEAD_BYTES {
+			return Err(Self::Error::InsufficientChunkBytes);
 		}
 
-		let length = u32::from_be_bytes(value[0..4].try_into().map_err(|_| ())?) as usize;
-		if value.len() - Self::OVERHEAD_BYTES < length {
-			return Err(());
+		let length = u32::from_be_bytes(value[0..4].try_into()?) as usize;
+		if actual_length - Self::OVERHEAD_BYTES < length {
+			return Err(Self::Error::LengthMismatch {
+				expected: actual_length as u32,
+				actual: length as u32
+			});
 		}
 
-		let type_code: [u8; 4] = value[4..8].try_into().map_err(|_| ())?;
+		let type_code: [u8; 4] = value[4..8].try_into()?;
 		let chunk_type = ChunkType::try_from(type_code)?;
 		
 		let data = value[8..8 + length].to_vec();
@@ -91,10 +120,11 @@ impl TryFrom<&[u8]> for Chunk {
 			data,
 		};
 		
+		let expected = chunk.crc();
 		let crc_start = 8 + length;
-		let crc = u32::from_be_bytes(value[crc_start..crc_start + 4].try_into().map_err(|_| ())?);
-		if crc != chunk.crc() {
-			return Err(());
+		let actual = u32::from_be_bytes(value[crc_start..crc_start + 4].try_into()?);
+		if expected != actual {
+			return Err(Self::Error::CRC32Mismatch {expected, actual});
 		}
 
 		Ok(chunk)
