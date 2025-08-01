@@ -76,7 +76,7 @@ pub enum ParseError {
 impl ChunkType {
 	// Helper for the FromStr impl below.
 	/// Parses the given string into a 4-byte array.
-	fn parse_type_code(s: &str) -> Result<[u8; 4], ParseError> {
+	fn parse(s: &str) -> Result<[u8; 4], ParseError> {
 		let bytes = s.as_bytes();
 		let length = bytes.len();
 		if length > 4 {
@@ -101,7 +101,7 @@ impl std::str::FromStr for ChunkType {
 	type Err = ChunkTypeError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let type_code = Self::parse_type_code(s)?;
+		let type_code = Self::parse(s)?;
 
 		Ok(ChunkType::try_from(type_code)?)
 	}

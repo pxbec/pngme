@@ -1,4 +1,4 @@
-use std::{str, usize};
+use std::io::{BufReader, Read};
 use crate::chunk_type;
 use crate::chunk_type::ChunkType;
 
@@ -39,7 +39,7 @@ impl Chunk {
 		digest.finalize()
 	}
 
-	pub fn data_as_str(&self) -> Result<&str, str::Utf8Error> {
+	pub fn data_as_str(&self) -> Result<&str, std::str::Utf8Error> {
 		str::from_utf8(&self.data)
 	}
 
@@ -69,65 +69,108 @@ impl std::fmt::Display for Chunk {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum ChunkError {
-	#[error("chunk type is not supported")]
-	FromSlice(#[from] std::array::TryFromSliceError),
-	
-	#[error("chunk data is shorter than the minimum required size")]
-	InsufficientChunkBytes,
-	
-	#[error("chunk length too short (expected '{expected}', got '{actual}')")]
+pub enum ParseError {
+	#[error("failed to read PNG chunk data: {0}")]
+	Io(#[from] std::io::Error),
+}
+
+impl Chunk {
+	fn parse<R: Read>(
+		reader: &mut BufReader<R>
+	) -> Result<(u32, [u8; 4], Vec<u8>, u32), ParseError> {
+		let mut len_bytes = [0u8; 4];
+		reader.read_exact(&mut len_bytes)?;
+		let length = u32::from_be_bytes(len_bytes);
+
+		let mut type_bytes = [0u8; 4];
+		reader.read_exact(&mut type_bytes)?;
+
+		let mut data = vec![0u8; length as usize];
+		reader.read_exact(&mut data)?;
+
+		let mut crc_bytes = [0u8; 4];
+		reader.read_exact(&mut crc_bytes)?;
+		let crc = u32::from_be_bytes(crc_bytes);
+
+		Ok((length, type_bytes, data, crc))
+	}
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ValidationError {
+	#[error("chunk length doesn't match (expected '{expected}', got '{actual}')")]
 	LengthMismatch {
 		expected: u32,
 		actual: u32,
 	},
-	
+
+	#[error(transparent)]
+	ChunkType(#[from] chunk_type::ValidationError),
+
 	#[error("crc failed (expected '{expected}', got '{actual}'")]
 	CRC32Mismatch {
 		expected: u32,
 		actual: u32,
 	},
-	
-	#[error(transparent)]
-	ChunkType(#[from] chunk_type::ValidationError),
+}
+
+impl Chunk {
+	fn validate(
+		length: u32,
+		type_code: [u8; 4],
+		data: Vec<u8>,
+		crc: u32,
+	) -> Result<Chunk, ValidationError> {
+		let chunk_type = ChunkType::try_from(type_code)?;
+
+		let chunk = Chunk {
+			chunk_type,
+			data,
+		};
+
+		let expected_length = chunk.length();
+		if expected_length != length {
+			return Err(ValidationError::LengthMismatch {
+				expected: expected_length,
+				actual: length,
+			});
+		}
+
+		let expected_crc = chunk.crc();
+		if expected_crc != crc {
+			return Err(ValidationError::CRC32Mismatch {
+				expected: expected_crc,
+				actual: crc,
+			});
+		}
+
+		Ok(chunk)
+	}
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ChunkError {
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
+
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+}
+
+impl <R: Read> TryFrom<BufReader<R>> for Chunk {
+	type Error = ChunkError;
+
+	fn try_from(mut reader: BufReader<R>) -> Result<Chunk, Self::Error> {
+		let (length, type_bytes, data, crc) = Chunk::parse(&mut reader)?;
+		Ok(Chunk::validate(length, type_bytes, data, crc)?)
+	}
 }
 
 impl TryFrom<&[u8]> for Chunk {
 	type Error = ChunkError;
 
 	fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-		// Minimum chunk size: 4 (len) + 4 (type) + 0 (msg) + 4 (crc)
-		let actual_length = value.len();
-		if actual_length < Self::OVERHEAD_BYTES {
-			return Err(Self::Error::InsufficientChunkBytes);
-		}
-
-		let length = u32::from_be_bytes(value[0..4].try_into()?) as usize;
-		if actual_length - Self::OVERHEAD_BYTES < length {
-			return Err(Self::Error::LengthMismatch {
-				expected: actual_length as u32,
-				actual: length as u32
-			});
-		}
-
-		let type_code: [u8; 4] = value[4..8].try_into()?;
-		let chunk_type = ChunkType::try_from(type_code)?;
-		
-		let data = value[8..8 + length].to_vec();
-		
-		let chunk = Chunk {
-			chunk_type,
-			data,
-		};
-		
-		let expected = chunk.crc();
-		let crc_start = 8 + length;
-		let actual = u32::from_be_bytes(value[crc_start..crc_start + 4].try_into()?);
-		if expected != actual {
-			return Err(Self::Error::CRC32Mismatch {expected, actual});
-		}
-
-		Ok(chunk)
+		Self::try_from(BufReader::new(value))
 	}
 }
 
