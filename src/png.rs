@@ -1,49 +1,45 @@
-use std::str::FromStr;
+use std::io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom};
 use crate::chunk;
 use crate::chunk::Chunk ;
 use crate::chunk_type::ChunkType;
 
-struct Png {
+pub struct Png {
 	chunks: Vec<Chunk>,
 }
 
 impl Png {
 	pub const STANDARD_HEADER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
-	fn from_chunks(chunks: Vec<Chunk>) -> Png {
+	pub fn from_chunks(chunks: Vec<Chunk>) -> Png {
 		Png { chunks }
 	}
 
-	fn append_chunk(&mut self, chunk: Chunk) {
+	pub fn append_chunk(&mut self, chunk: Chunk) {
 		self.chunks.push(chunk);
 	}
 
-	fn remove_first_chunk(&mut self, chunk_type: &str) -> Result<Chunk, ()> {
-		let Ok(target_type) = ChunkType::from_str(chunk_type) else {
-			return Err(());
-		};
-
-		let index = self.chunks.iter().position(|c| c.chunk_type() == &target_type).ok_or(())?;
-		Ok(self.chunks.remove(index))
+	pub fn remove_first_chunk(&mut self, chunk_type: &ChunkType) -> Option<Chunk> {
+		self.chunks
+			.iter()
+			.position(|chunk| chunk.chunk_type() == chunk_type)
+			.map(|index| self.chunks.remove(index))
 	}
 
-	fn header(&self) -> &[u8; 8] {
+	pub fn header(&self) -> &[u8; 8] {
 		&Self::STANDARD_HEADER
 	}
 
-	fn chunks(&self) -> &[Chunk] {
+	pub fn chunks(&self) -> &[Chunk] {
 		&self.chunks
 	}
 
-	fn chunk_by_type(&self, chunk_type: &str) -> Option<&Chunk> {
-		let search_for = ChunkType::from_str(chunk_type).ok()?;
-
+	pub fn chunk_by_type(&self, chunk_type: &ChunkType) -> Option<&Chunk> {
 		self.chunks
 			.iter()
-			.find(|c| c.chunk_type() == &search_for)
+			.find(|chunk| chunk.chunk_type() == chunk_type)
 	}
 
-	fn as_bytes(&self) -> Vec<u8> {
+	pub fn as_bytes(&self) -> Vec<u8> {
 		self.header()
 			.iter()
 			.copied()
@@ -56,72 +52,102 @@ impl Png {
 	}
 }
 
-impl std::fmt::Display for Png {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		self.chunks.iter().try_for_each(|chunk| chunk.chunk_type().fmt(f))?;
-		write!(f, "png")
+#[derive(thiserror::Error, Debug)]
+pub enum ReadError {
+	#[error("failed to read PNG: {0}")]
+	Io(#[from] Error),
+}
+
+impl Png {
+	fn read(value: &[u8]) -> Result<([u8; Self::STANDARD_HEADER.len()], Vec<&[u8]>), ReadError> {
+		let mut cursor = Cursor::new(value);
+
+		let header_len = Self::STANDARD_HEADER.len();
+		let mut header = [0u8; Self::STANDARD_HEADER.len()];
+		if value.len() < header_len {
+			return Err(ReadError::Io(Error::new(
+				ErrorKind::UnexpectedEof,
+				"PNG file too short to contain header",
+			)));
+		}
+		cursor.read_exact(&mut header)?;
+
+		let mut chunk_slices: Vec<&[u8]> = Vec::new();
+		while cursor.position() < value.len() as u64 {
+			let start = cursor.stream_position()? as usize;
+
+			let mut length_buffer = [0u8; 4];
+            cursor.read_exact(&mut length_buffer)?;
+            let data_length = u32::from_be_bytes(length_buffer) as usize;
+
+			let end = start + data_length + Chunk::OVERHEAD_BYTES;
+			if end > value.len() {
+				return Err(ReadError::Io(Error::new(
+					ErrorKind::UnexpectedEof,
+					format!(
+						"chunk at offset {} claims {} bytes of data ({} total) but only {} bytes remain",
+						start,
+						data_length,
+						data_length + Chunk::OVERHEAD_BYTES,
+						value.len().saturating_sub(start),
+					)
+				)));
+			}
+			chunk_slices.push(&value[start..end]);
+
+			cursor.seek(SeekFrom::Start(end as u64))?;
+		}
+		Ok((header, chunk_slices))
+	}
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ValidationError {
+	#[error("invalid PNG signature")]
+	InvalidSignature,
+
+	#[error("error processing chunks")]
+	Chunk(#[from] chunk::ChunkError),
+}
+
+impl Png {
+	fn validate(header: &[u8; Self::STANDARD_HEADER.len()], chunk_slices: Vec<&[u8]>) -> Result<Png, ValidationError> {
+		if header != &Self::STANDARD_HEADER {
+			return Err(ValidationError::InvalidSignature);
+		}
+
+		let mut chunks = vec!();
+		for slice in chunk_slices {
+			chunks.push(Chunk::try_from(slice)?);
+		}
+
+		Ok(Png {chunks})
 	}
 }
 
 #[derive(thiserror::Error, Debug)]
 pub enum PngError {
-	#[error("invalid PNG signature")]
-	InvalidSignature,
+	#[error(transparent)]
+	Validation(#[from] ValidationError),
 
-	#[error("no data after PNG signature")]
-	NoData,
-
-	#[error("invalid chunk data")]
-	InvalidChunk(#[from] chunk::ChunkError),
-
-	#[error("unexpected end of data while reading chunks")]
-	UnexpectedEof,
-
-	#[error("error processing chunks")]
-	ChunkProcessing {
-		#[source]
-		source: Box<dyn std::error::Error + Send + Sync>,
-		chunk_offset: usize,
-	}
+	#[error(transparent)]
+	Read(#[from] ReadError),
 }
 
 impl TryFrom<&[u8]> for Png {
 	type Error = PngError;
 
 	fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-		let (signature, rest) = value.split_at_checked(Self::STANDARD_HEADER.len())
-			.ok_or(PngError::InvalidSignature)?;
-		if signature != Self::STANDARD_HEADER {
-			return Err(PngError::InvalidSignature);
-		}
-		
-		if rest.is_empty() {
-			return Err(PngError::NoData);
-		}
+		let (header, chunk_slices) = Self::read(value)?;
+		let png = Self::validate(&header, chunk_slices)?;
+		Ok(png)
+	}
+}
 
-		let mut chunks = Vec::new();
-		let mut remaining = rest;
-		let mut offset = Self::STANDARD_HEADER.len();
-		while !remaining.is_empty() {
-			let chunk = Chunk::try_from(remaining).map_err(|e| {
-				PngError::ChunkProcessing {
-					source: Box::new(e),
-					chunk_offset: offset,
-				}
-			})?;
-
-			let data_length = chunk.length();
-			let total_chunk_len = Chunk::OVERHEAD_BYTES + data_length as usize;
-			if remaining.len() < total_chunk_len {
-				return Err(PngError::UnexpectedEof);
-			}
-			
-			chunks.push(chunk);
-			remaining = &remaining[total_chunk_len..];
-			offset += total_chunk_len;
-		}
-
-		Ok(Png { chunks })
+impl std::fmt::Display for Png {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.chunks.iter().try_for_each(|chunk| chunk.chunk_type().fmt(f))?;
+		write!(f, "png")
 	}
 }
 
@@ -133,6 +159,7 @@ mod tests {
 	use crate::chunk_type::{ChunkType, ChunkTypeError};
 	use crate::chunk::Chunk;
 	use std::convert::TryFrom;
+	use std::str::FromStr;
 
 	fn testing_chunks() -> Vec<Chunk> {
 		vec![
@@ -233,7 +260,8 @@ mod tests {
 	#[test]
 	fn test_chunk_by_type() {
 		let png = testing_png();
-		let chunk = png.chunk_by_type("FrSt").unwrap();
+		let chunk_type = ChunkType::from_str("FrSt").unwrap();
+		let chunk = png.chunk_by_type(&chunk_type).unwrap();
 		assert_eq!(chunk.chunk_type().to_string(), "FrSt");
 		assert_eq!(chunk.data_as_str().unwrap(), "I am the first chunk");
 	}
@@ -242,7 +270,8 @@ mod tests {
 	fn test_append_chunk() {
 		let mut png = testing_png();
 		png.append_chunk(chunk_from_strings("TeSt", "Message").unwrap());
-		let chunk = png.chunk_by_type("TeSt").unwrap();
+		let chunk_type = ChunkType::from_str("TeSt").unwrap();
+		let chunk = png.chunk_by_type(&chunk_type).unwrap();
 		assert_eq!(chunk.chunk_type().to_string(), "TeSt");
 		assert_eq!(chunk.data_as_str().unwrap(), "Message");
 	}
@@ -251,8 +280,9 @@ mod tests {
 	fn test_remove_first_chunk() {
 		let mut png = testing_png();
 		png.append_chunk(chunk_from_strings("TeSt", "Message").unwrap());
-		png.remove_first_chunk("TeSt").unwrap();
-		let chunk = png.chunk_by_type("TeSt");
+		let chunk_type = ChunkType::from_str("TeSt").unwrap();
+		png.remove_first_chunk(&chunk_type).unwrap();
+		let chunk = png.chunk_by_type(&chunk_type);
 		assert!(chunk.is_none());
 	}
 

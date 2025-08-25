@@ -30,13 +30,6 @@ impl ChunkType {
 	}
 }
 
-impl std::fmt::Display for ChunkType {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let s: String = self.type_code.iter().map(|&b| b as char).collect();
-		write!(f, "{s}")
-	}
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum ValidationError {
 	#[error("chunk type contains non-ASCII characters")]
@@ -46,18 +39,16 @@ pub enum ValidationError {
 	ReservedBit,
 }
 
-impl TryFrom<[u8; 4]> for ChunkType {
-	type Error = ValidationError;
-
-	fn try_from(value: [u8; 4]) -> Result<Self, Self::Error> {
+impl ChunkType {
+	fn validate(value: [u8; 4]) -> Result<Self, ValidationError> {
 		let ct = ChunkType { type_code: value };
 
 		if !ct.type_code.iter().all(|b| b.is_ascii_alphabetic()) {
-			return Err(Self::Error::NonAscii);
+			return Err(ValidationError::NonAscii);
 		}
 
 		if !ct.is_reserved_bit_valid() {
-			return Err(Self::Error::ReservedBit);
+			return Err(ValidationError::ReservedBit);
 		}
 
 		Ok(ct)
@@ -66,10 +57,7 @@ impl TryFrom<[u8; 4]> for ChunkType {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ParseError {
-	#[error("expected 4 bytes, but was given {0}")]
-	InvalidLength(usize),
-
-	#[error("error converting string slice '{0}' into array")]
+	#[error(transparent)]
 	FromSlice(#[from] std::array::TryFromSliceError),
 }
 
@@ -78,11 +66,6 @@ impl ChunkType {
 	/// Parses the given string into a 4-byte array.
 	fn parse(s: &str) -> Result<[u8; 4], ParseError> {
 		let bytes = s.as_bytes();
-		let length = bytes.len();
-		if length > 4 {
-			return Err(ParseError::InvalidLength(length));
-		}
-
 		let type_code: [u8; 4] = bytes.try_into()?;
 		Ok(type_code)
 	}
@@ -97,13 +80,27 @@ pub enum ChunkTypeError {
 	Validation(#[from] ValidationError),
 }
 
+impl TryFrom<[u8; 4]> for ChunkType {
+	type Error = ChunkTypeError;
+
+	fn try_from(value: [u8; 4]) -> Result<Self, Self::Error> {
+		Ok(Self::validate(value)?)
+	}
+}
+
 impl std::str::FromStr for ChunkType {
 	type Err = ChunkTypeError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
 		let type_code = Self::parse(s)?;
-
 		Ok(ChunkType::try_from(type_code)?)
+	}
+}
+
+impl std::fmt::Display for ChunkType {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		let s: String = self.type_code.iter().map(|&b| b as char).collect();
+		write!(f, "{s}")
 	}
 }
 

@@ -1,6 +1,6 @@
-use std::io::{BufReader, Read};
 use crate::chunk_type;
 use crate::chunk_type::ChunkType;
+use std::io::Read;
 
 
 #[derive(Debug, Clone)]
@@ -55,29 +55,16 @@ impl Chunk {
 	}
 }
 
-impl std::fmt::Display for Chunk {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		let chunk_type_str = self.chunk_type.to_string();
-
-		let data_str = match str::from_utf8(&self.data) {
-			Ok(s) => s.to_string(),
-			Err(_) => format!("{:?}", &self.data),
-		};
-
-		write!(f, "Chunk Type: {}\nData: {}", chunk_type_str, data_str)
-	}
-}
-
 #[derive(thiserror::Error, Debug)]
-pub enum ParseError {
+pub enum ReadError {
 	#[error("failed to read PNG chunk data: {0}")]
 	Io(#[from] std::io::Error),
 }
 
 impl Chunk {
-	fn parse<R: Read>(
-		reader: &mut BufReader<R>
-	) -> Result<(u32, [u8; 4], Vec<u8>, u32), ParseError> {
+	fn read(value: &[u8]) -> Result<(u32, [u8; 4], Vec<u8>, u32), ReadError> {
+		let mut reader = std::io::BufReader::new(value);
+
 		let mut len_bytes = [0u8; 4];
 		reader.read_exact(&mut len_bytes)?;
 		let length = u32::from_be_bytes(len_bytes);
@@ -105,7 +92,7 @@ pub enum ValidationError {
 	},
 
 	#[error(transparent)]
-	ChunkType(#[from] chunk_type::ValidationError),
+	ChunkType(#[from] chunk_type::ChunkTypeError),
 
 	#[error("crc failed (expected '{expected}', got '{actual}'")]
 	CRC32Mismatch {
@@ -154,26 +141,30 @@ pub enum ChunkError {
     Validation(#[from] ValidationError),
 
     #[error(transparent)]
-    Parse(#[from] ParseError),
-}
-
-impl <R: Read> TryFrom<BufReader<R>> for Chunk {
-	type Error = ChunkError;
-
-	fn try_from(mut reader: BufReader<R>) -> Result<Chunk, Self::Error> {
-		let (length, type_bytes, data, crc) = Chunk::parse(&mut reader)?;
-		Ok(Chunk::validate(length, type_bytes, data, crc)?)
-	}
+    Read(#[from] ReadError),
 }
 
 impl TryFrom<&[u8]> for Chunk {
 	type Error = ChunkError;
 
 	fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-		Self::try_from(BufReader::new(value))
+		let (length, type_code, data, crc) = Chunk::read(value)?;
+		let chunk = Chunk::validate(length, type_code, data, crc)?;
+		Ok(chunk)
 	}
 }
 
+impl std::fmt::Display for Chunk {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		writeln!(f, "Chunk {{",)?;
+		writeln!(f, "  Length: {}", self.length())?;
+		writeln!(f, "  Type: {}", self.chunk_type())?;
+		writeln!(f, "  Data: {} bytes", self.data().len())?;
+		writeln!(f, "  Crc: {}", self.crc())?;
+		writeln!(f, "}}",)?;
+		Ok(())
+	}
+}
 
 #[cfg(test)]
 mod tests {
